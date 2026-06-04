@@ -18,7 +18,7 @@ import jax.random as jr
 import lineax as lx
 import pytest
 
-from .helpers import tree_allclose
+from .helpers import construct_poisson_matrix, tree_allclose
 
 
 def test_gmres_large_dense(getkey):
@@ -45,6 +45,19 @@ def test_nontrivial_pytree_operator():
     operator = lx.PyTreeLinearOperator(x, struct)
     out = lx.linear_solve(operator, y).value
     true_out = [jnp.array(-3.25), jnp.array(1.25)]
+    assert tree_allclose(out, true_out)
+
+
+def test_nontrivial_diagonal_operator():
+    x = (8.0, jnp.array([1, 2, 3]), {"a": jnp.array([4, 5]), "b": 6})
+    y = (4.0, jnp.array([7, 8, 9]), {"a": jnp.array([2, 10]), "b": 12})
+    operator = lx.DiagonalLinearOperator(x)
+    out = lx.linear_solve(operator, y).value
+    true_out = (
+        jnp.array(0.5),
+        jnp.array([7.0, 4.0, 3.0]),
+        {"a": jnp.array([0.5, 2.0]), "b": jnp.array(2.0)},
+    )
     assert tree_allclose(out, true_out)
 
 
@@ -156,3 +169,93 @@ def test_grad_vmap_symbolic_cotangent():
 
     x = (jnp.arange(3.0), jnp.arange(3.0))
     to_grad(x)
+
+
+@pytest.mark.parametrize(
+    "solver",
+    (
+        lx.CG(0.0, 0.0, max_steps=2),
+        lx.Normal(lx.CG(0.0, 0.0, max_steps=2)),
+        lx.BiCGStab(0.0, 0.0, max_steps=2),
+        lx.GMRES(0.0, 0.0, max_steps=2),
+        lx.LSMR(0.0, 0.0, max_steps=2),
+    ),
+)
+def test_iterative_solver_max_steps_only(solver):
+    """Iterative solvers should work with max_steps only (no Equinox errors)."""
+    SIZE = 100
+
+    poisson_matrix = construct_poisson_matrix(SIZE)
+    poisson_operator = lx.MatrixLinearOperator(
+        poisson_matrix, tags=(lx.negative_semidefinite_tag, lx.symmetric_tag)
+    )
+    rhs = jax.random.normal(jax.random.key(0), (SIZE,))
+
+    lx.linear_solve(poisson_operator, rhs, solver)
+
+
+def test_solver_init_not_differentiated(getkey):
+    """stop_gradient should be applied before solver.init, not after.
+
+    Also checks that dynamic arrays in options don't cause issues.
+    """
+
+    class DisallowGradWrapper(lx._solve.AbstractLinearSolver):
+        solver: lx._solve.AbstractLinearSolver
+
+        def init(self, operator, options):
+            @jax.custom_jvp
+            def f(operator, dummy):
+                del dummy
+                return self.solver.init(operator, options)
+
+            @f.defjvp
+            def _(*args):
+                raise NotImplementedError("solver.init should not be differentiated")
+
+            return f(operator, options.get("dummy"))
+
+        def compute(self, state, vector, options):
+            return self.solver.compute(state, vector, options)
+
+        def transpose(self, state, options):
+            return self.solver.transpose(state, options)
+
+        def conj(self, state, options):
+            return self.solver.conj(state, options)
+
+        def assume_full_rank(self):
+            return self.solver.assume_full_rank()
+
+    m = jax.random.normal(getkey(), (3, 3))
+    mt = jax.random.normal(getkey(), (3, 3))
+    v = jax.random.normal(getkey(), (3,))
+    dummy = jnp.array(1.0)
+
+    def f(m):
+        op = lx.MatrixLinearOperator(m)
+        return lx.linear_solve(
+            op, v, solver=DisallowGradWrapper(lx.QR()), options={"dummy": dummy}
+        ).value
+
+    # Differentiating through operator only, but options has a dynamic array.
+    # solver.init should not be differentiated through.
+    jax.jvp(f, (m,), (mt,))
+
+    _, f_vjp = jax.vjp(f, m)
+    f_vjp(v)
+
+
+def test_nonfinite_input():
+    operator = lx.DiagonalLinearOperator((1.0, 1.0))
+    vector = (1.0, jnp.inf)
+    sol = lx.linear_solve(operator, vector, throw=False)
+    assert sol.result == lx.RESULTS.nonfinite_input
+
+    vector = (1.0, jnp.nan)
+    sol = lx.linear_solve(operator, vector, throw=False)
+    assert sol.result == lx.RESULTS.nonfinite_input
+
+    vector = (jnp.nan, jnp.inf)
+    sol = lx.linear_solve(operator, vector, throw=False)
+    assert sol.result == lx.RESULTS.nonfinite_input

@@ -8,3 +8,5 @@ examples/data
 .all_objects.cache
 .pymon
 .idea
+.venv
+uv.lock

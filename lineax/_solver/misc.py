@@ -13,22 +13,18 @@
 # limitations under the License.
 
 import math
+import typing
 import warnings
-from typing import Any, NewType
+from typing import Any, NewType, TYPE_CHECKING
 
-import equinox as eqx
 import equinox.internal as eqxi
-import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
 from jaxtyping import Array, PyTree, Shaped
 
-from .._operator import (
-    AbstractLinearOperator,
-    IdentityLinearOperator,
-    is_positive_semidefinite,
-)
+from .._misc import strip_weak_dtype, structure_equal
+from .._operator import AbstractLinearOperator, IdentityLinearOperator, linearise
 
 
 def preconditioner_and_y0(
@@ -36,41 +32,46 @@ def preconditioner_and_y0(
 ):
     structure = operator.in_structure()
     try:
-        preconditioner = options["preconditioner"]
+        preconditioner = linearise(options["preconditioner"])
     except KeyError:
         preconditioner = IdentityLinearOperator(structure)
     else:
         if not isinstance(preconditioner, AbstractLinearOperator):
             raise ValueError("The preconditioner must be a linear operator.")
-        if preconditioner.in_structure() != structure:
+        if not structure_equal(preconditioner.in_structure(), structure):
             raise ValueError(
                 "The preconditioner must have `in_structure` that matches the "
                 "operator's `in_strucure`."
             )
-        if preconditioner.out_structure() != structure:
+        if not structure_equal(preconditioner.out_structure(), structure):
             raise ValueError(
                 "The preconditioner must have `out_structure` that matches the "
                 "operator's `in_structure`."
             )
-        if not is_positive_semidefinite(preconditioner):
-            raise ValueError("The preconditioner must be positive definite.")
     try:
         y0 = options["y0"]
     except KeyError:
         y0 = jtu.tree_map(jnp.zeros_like, vector)
     else:
-        if jax.eval_shape(lambda: y0) != jax.eval_shape(lambda: vector):
+        if not structure_equal(y0, vector):
             raise ValueError(
                 "`y0` must have the same structure, shape, and dtype as `vector`"
             )
     return preconditioner, y0
 
 
-PackedStructures = NewType("PackedStructures", eqxi.Static)
+# This seems to introduce some spurious failure at docgen time.
+if hasattr(typing, "GENERATING_DOCUMENTATION") and not TYPE_CHECKING:
+    PackedStructures = lambda x: x
+else:
+    PackedStructures = NewType("PackedStructures", eqxi.Static)
 
 
 def pack_structures(operator: AbstractLinearOperator) -> PackedStructures:
-    structures = operator.out_structure(), operator.in_structure()
+    structures = (
+        strip_weak_dtype(operator.out_structure()),
+        strip_weak_dtype(operator.in_structure()),
+    )
     leaves, treedef = jtu.tree_flatten(structures)  # handle nonhashable pytrees
     return PackedStructures(eqxi.Static((leaves, treedef)))
 
@@ -81,7 +82,7 @@ def ravel_vector(
     leaves, treedef = packed_structures.value
     out_structure, _ = jtu.tree_unflatten(treedef, leaves)
     # `is` in case `tree_equal` returns a Tracer.
-    if eqx.tree_equal(jax.eval_shape(lambda: pytree), out_structure) is not True:
+    if not structure_equal(pytree, out_structure):
         raise ValueError("pytree does not match out_structure")
     # not using `ravel_pytree` as that doesn't come with guarantees about order
     leaves = jtu.tree_leaves(pytree)

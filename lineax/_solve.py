@@ -14,8 +14,7 @@
 
 import abc
 import functools as ft
-from typing import Any, Generic, Optional, TypeVar
-from typing_extensions import TypeAlias
+from typing import Any, Generic, TypeAlias, TypeVar
 
 import equinox as eqx
 import equinox.internal as eqxi
@@ -30,10 +29,11 @@ from jax._src.ad_util import stop_gradient_p
 from jaxtyping import Array, ArrayLike, PyTree
 
 from ._custom_types import sentinel
-from ._misc import inexact_asarray
+from ._misc import inexact_asarray, strip_weak_dtype
 from ._operator import (
     AbstractLinearOperator,
     conj,
+    FunctionLinearOperator,
     IdentityLinearOperator,
     is_diagonal,
     is_lower_triangular,
@@ -45,6 +45,10 @@ from ._operator import (
     TangentLinearOperator,
 )
 from ._solution import RESULTS, Solution
+from ._tags import (
+    invert_tags,
+    tags_from_checks,
+)
 
 
 #
@@ -90,14 +94,24 @@ def _linear_solve_impl(_, state, vector, options, solver, throw, *, check_closur
             out, name="lineax.linear_solve with respect to a closed-over value"
         )
     solution, result, stats = out
-    has_nonfinites = jnp.any(
+    has_nonfinite_output = jnp.any(
         jnp.stack(
             [jnp.any(jnp.invert(jnp.isfinite(x))) for x in jtu.tree_leaves(solution)]
         )
     )
     result = RESULTS.where(
-        (result == RESULTS.successful) & has_nonfinites,
+        (result == RESULTS.successful) & has_nonfinite_output,
         RESULTS.singular,
+        result,
+    )
+    has_nonfinite_input = jnp.any(
+        jnp.stack(
+            [jnp.any(jnp.invert(jnp.isfinite(x))) for x in jtu.tree_leaves(vector)]
+        )
+    )
+    result = RESULTS.where(
+        (result == RESULTS.singular) & has_nonfinite_input,
+        RESULTS.nonfinite_input,
         result,
     )
     if throw:
@@ -189,16 +203,17 @@ def _linear_solve_jvp(primals, tangents):
         # -A'x term
         vec = (-(t_operator.mv(solution) ** ω)).ω
         vecs.append(vec)
-        allow_dependent_rows = solver.allow_dependent_rows(operator)
-        allow_dependent_columns = solver.allow_dependent_columns(operator)
-        if allow_dependent_rows or allow_dependent_columns:
+        rows, columns = operator.out_size(), operator.in_size()
+        assume_independent_rows = solver.assume_full_rank() and rows <= columns
+        assume_independent_columns = solver.assume_full_rank() and columns <= rows
+        if not assume_independent_rows or not assume_independent_columns:
             operator_conj_transpose = conj(operator).transpose()
             t_operator_conj_transpose = conj(t_operator).transpose()
             state_conj, options_conj = solver.conj(state, options)
             state_conj_transpose, options_conj_transpose = solver.transpose(
                 state_conj, options_conj
             )
-        if allow_dependent_rows:
+        if not assume_independent_rows:
             lst_sqr_diff = (vector**ω - operator.mv(solution) ** ω).ω
             tmp = t_operator_conj_transpose.mv(lst_sqr_diff)  # pyright: ignore
             tmp, _, _ = eqxi.filter_primitive_bind(
@@ -212,7 +227,7 @@ def _linear_solve_jvp(primals, tangents):
             )
             vecs.append(tmp)
 
-        if allow_dependent_columns:
+        if not assume_independent_columns:
             tmp1, _, _ = eqxi.filter_primitive_bind(
                 linear_solve_p,
                 operator_conj_transpose,  # pyright: ignore
@@ -318,7 +333,7 @@ eqxi.register_impl_finalisation(linear_solve_p)
 _SolverState = TypeVar("_SolverState")
 
 
-class AbstractLinearSolver(eqx.Module, Generic[_SolverState], strict=True):
+class AbstractLinearSolver(eqx.Module, Generic[_SolverState]):
     """Abstract base class for all linear solvers."""
 
     @abc.abstractmethod
@@ -384,56 +399,6 @@ class AbstractLinearSolver(eqx.Module, Generic[_SolverState], strict=True):
         """
 
     @abc.abstractmethod
-    def allow_dependent_columns(self, operator: AbstractLinearOperator) -> bool:
-        """Does this method ever produce non-NaN outputs for operators with linearly
-        dependent columns? (Even if only sometimes.)
-
-        If `True` then a more expensive backward pass is needed, to account for the
-        extra generality.
-
-        If you do not need to autodifferentiate through a custom linear solver then you
-        simply define this method as
-        ```python
-        class MyLinearSolver(AbstractLinearsolver):
-            def allow_dependent_columns(self, operator):
-                raise NotImplementedError
-        ```
-
-        **Arguments:**
-
-        - `operator`: a linear operator.
-
-        **Returns:**
-
-        Either `True` or `False`.
-        """
-
-    @abc.abstractmethod
-    def allow_dependent_rows(self, operator: AbstractLinearOperator) -> bool:
-        """Does this method ever produce non-NaN outputs for operators with
-        linearly dependent rows? (Even if only sometimes)
-
-        If `True` then a more expensive backward pass is needed, to account for the
-        extra generality.
-
-        If you do not need to autodifferentiate through a custom linear solver then you
-        simply define this method as
-        ```python
-        class MyLinearSolver(AbstractLinearsolver):
-            def allow_dependent_rows(self, operator):
-                raise NotImplementedError
-        ```
-
-        **Arguments:**
-
-        - `operator`: a linear operator.
-
-        **Returns:**
-
-        Either `True` or `False`.
-        """
-
-    @abc.abstractmethod
     def transpose(
         self, state: _SolverState, options: dict[str, Any]
     ) -> tuple[_SolverState, dict[str, Any]]:
@@ -490,6 +455,23 @@ class AbstractLinearSolver(eqx.Module, Generic[_SolverState], strict=True):
         - The options for the conjugated operator.
         """
 
+    @abc.abstractmethod
+    def assume_full_rank(self) -> bool:
+        """Does this solver assume that all operators are full rank?
+
+        When `False`, a more expensive backward pass is needed to account for
+        the extra generality. In a custom linear solver, it is always safe to
+        return False.
+
+        **Arguments:**
+
+        Nothing.
+
+        **Returns:**
+
+        Either `True` or `False`.
+        """
+
 
 _qr_token = eqxi.str2jax("qr_token")
 _diagonal_token = eqxi.str2jax("diagonal_token")
@@ -526,7 +508,7 @@ def _lookup(token) -> AbstractLinearSolver:
 _AutoLinearSolverState: TypeAlias = tuple[Any, Any]
 
 
-class AutoLinearSolver(AbstractLinearSolver[_AutoLinearSolverState], strict=True):
+class AutoLinearSolver(AbstractLinearSolver[_AutoLinearSolverState]):
     """Automatically determines a good linear solver based on the structure of the
     operator.
 
@@ -534,7 +516,7 @@ class AutoLinearSolver(AbstractLinearSolver[_AutoLinearSolverState], strict=True
         - If the operator is diagonal, then use [`lineax.Diagonal`][].
         - If the operator is tridiagonal, then use [`lineax.Tridiagonal`][].
         - If the operator is triangular, then use [`lineax.Triangular`][].
-        - If the matrix is positive or negative definite, then use
+        - If the matrix is positive or negative (semi-)definite, then use
             [`lineax.Cholesky`][].
         - Else use [`lineax.LU`][].
 
@@ -553,7 +535,7 @@ class AutoLinearSolver(AbstractLinearSolver[_AutoLinearSolverState], strict=True
         - If the operator is diagonal, then use [`lineax.Diagonal`][].
         - If the operator is tridiagonal, then use [`lineax.Tridiagonal`][].
         - If the operator is triangular, then use [`lineax.Triangular`][].
-        - If the matrix is positive or negative definite, then use
+        - If the matrix is positive or negative (semi-)definite, then use
             [`lineax.Cholesky`][].
         - Else, use [`lineax.LU`][].
 
@@ -561,7 +543,7 @@ class AutoLinearSolver(AbstractLinearSolver[_AutoLinearSolverState], strict=True
     handle ill-posed systems as long as it is not computationally expensive to do so.
     """
 
-    well_posed: Optional[bool]
+    well_posed: bool | None
 
     def _select_solver(self, operator: AbstractLinearOperator):
         if self.well_posed is True:
@@ -652,13 +634,8 @@ class AutoLinearSolver(AbstractLinearSolver[_AutoLinearSolverState], strict=True
         conj_state = (token, conj_state)
         return conj_state, conj_options
 
-    def allow_dependent_columns(self, operator: AbstractLinearOperator) -> bool:
-        token = self._select_solver(operator)
-        return _lookup(token).allow_dependent_columns(operator)
-
-    def allow_dependent_rows(self, operator: AbstractLinearOperator) -> bool:
-        token = self._select_solver(operator)
-        return _lookup(token).allow_dependent_rows(operator)
+    def assume_full_rank(self):
+        return self.well_posed is not False
 
 
 AutoLinearSolver.__init__.__doc__ = """**Arguments:**
@@ -675,7 +652,7 @@ def linear_solve(
     vector: PyTree[ArrayLike],
     solver: AbstractLinearSolver = AutoLinearSolver(well_posed=True),
     *,
-    options: Optional[dict[str, Any]] = None,
+    options: dict[str, Any] | None = None,
     state: PyTree[Any] = sentinel,
     throw: bool = True,
 ) -> Solution:
@@ -745,11 +722,15 @@ def linear_solve(
         [`lineax.CG`][] allows for specifying a preconditioner. See each individual
         solver's documentation for more details. Keyword only argument.
 
-    - `state`: If performing multiple linear solves with the same operator, then it is
-        possible to save re-use some computation between these solves, and to pass the
-        result of any intermediate computation in as this argument. See
-        [`lineax.AbstractLinearSolver.init`][] for more details. Keyword only
-        argument.
+    - `state`: If performing multiple linear solves with the same operator, then some
+        computation can be saved by recording and reusing some information; for example
+        the matrix factorisation of the operator. This value should be the result of
+        calling [`lineax.AbstractLinearSolver.init`][] on the provided `operator`.
+
+        If provided, then the underlying `operator` must still be passed to
+        `linear_solve`.
+
+        Keyword only argument.
 
     - `throw`: How to report any failures. (E.g. an iterative solver running out of
         steps, or a well-posed-only solver being run with a singular operator.)
@@ -778,8 +759,8 @@ def linear_solve(
     if options is None:
         options = {}
     vector = jtu.tree_map(inexact_asarray, vector)
-    vector_struct = jax.eval_shape(lambda: vector)
-    operator_out_structure = operator.out_structure()
+    vector_struct = strip_weak_dtype(jax.eval_shape(lambda: vector))
+    operator_out_structure = strip_weak_dtype(operator.out_structure())
     # `is` to handle tracers
     if eqx.tree_equal(vector_struct, operator_out_structure) is not True:
         raise ValueError(
@@ -795,12 +776,15 @@ def linear_solve(
             stats={},
         )
     if state == sentinel:
-        state = solver.init(operator, options)
-        dynamic_state, static_state = eqx.partition(state, eqx.is_array)
-        dynamic_state = lax.stop_gradient(dynamic_state)
-        state = eqx.combine(dynamic_state, static_state)
+        dynamic_operator, static_operator = eqx.partition(operator, eqx.is_array)
+        stopped_operator = eqx.combine(
+            lax.stop_gradient(dynamic_operator), static_operator
+        )
+        state = solver.init(stopped_operator, options)
 
-    state = eqxi.nondifferentiable(state, name="`lineax.linear_solve(..., state=...)`")
+    dynamic_state, static_state = eqx.partition(state, eqx.is_array)
+    dynamic_state = lax.stop_gradient(dynamic_state)
+    state = eqx.combine(dynamic_state, static_state)
     options = eqxi.nondifferentiable(
         options, name="`lineax.linear_solve(..., options=...)`"
     )
@@ -813,6 +797,65 @@ def linear_solve(
     # TODO: prevent forward-mode autodiff through stats
     stats = eqxi.nondifferentiable_backward(stats)
     return Solution(value=solution, result=result, state=state, stats=stats)
+
+
+def invert(
+    operator: AbstractLinearOperator,
+    solver: AbstractLinearSolver = AutoLinearSolver(well_posed=True),
+    *,
+    options: dict[str, Any] | None = None,
+    state: PyTree[Any] = sentinel,
+    throw: bool = True,
+) -> FunctionLinearOperator:
+    r"""Returns a [`lineax.FunctionLinearOperator`][] representing the
+    (pseudo)inverse of `operator`.
+
+    `invert(A).mv(v)` is equivalent to `linear_solve(A, v, solver).value`.
+    See [`lineax.linear_solve`][] for details on how the solution is defined
+    for square, overdetermined, and underdetermined systems.
+
+    The returned operator fully supports AD (both forward and reverse mode),
+    `vmap`, and composition with other operators.
+
+    **Arguments:**
+
+    - `operator`: the linear operator to invert.
+    - `solver`: the linear solver to use. Defaults to
+        `AutoLinearSolver(well_posed=True)`.
+    - `options`: additional options passed to the solver. Defaults to `None`.
+    - `state`: if passed, this should be the state of the solver, as initialised by
+        `solver.init(operator, options)`. This is useful for reusing the result of an
+        already-computed `solver.init` (e.g. a matrix factorisation). If not passed
+        then it will be initialised, with gradients stopped through the operator (as
+        in [`lineax.linear_solve`][]).
+    - `throw`: as [`lineax.linear_solve`][]. Defaults to `True`.
+
+    **Returns:**
+
+    A [`lineax.FunctionLinearOperator`][] whose `mv` solves `operator @ x = v`.
+    """
+    if options is None:
+        options = {}
+
+    if state == sentinel:
+        dynamic_operator, static_operator = eqx.partition(operator, eqx.is_array)
+        stopped_operator = eqx.combine(
+            lax.stop_gradient(dynamic_operator), static_operator
+        )
+        state = solver.init(stopped_operator, options)
+
+    def solve_fn(vector):
+        return linear_solve(
+            operator,
+            vector,
+            solver,
+            state=state,
+            options=options,
+            throw=throw,
+        ).value
+
+    tags = invert_tags(tags_from_checks(operator))
+    return FunctionLinearOperator(solve_fn, operator.out_structure(), tags)
 
 
 # Work around JAX issue #22011,

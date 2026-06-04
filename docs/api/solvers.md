@@ -5,16 +5,16 @@ If you're not sure what to use, then pick [`lineax.AutoLinearSolver`][] and it w
 ??? abstract "`lineax.AbstractLinearSolver`"
 
     ::: lineax.AbstractLinearSolver
-        selection:
+        options:
             members:
                 - init
                 - compute
-                - allow_dependent_columns
-                - allow_dependent_rows
                 - transpose
+                - conj
+                - assume_full_rank
 
 ::: lineax.AutoLinearSolver
-    selection:
+    options:
         members:
             - __init__
             - select_solver
@@ -22,63 +22,44 @@ If you're not sure what to use, then pick [`lineax.AutoLinearSolver`][] and it w
 ---
 
 ::: lineax.LU
-    selection:
+    options:
         members:
-            false
+            - __init__
 
 ## Least squares solvers
 
 These are capable of solving ill-posed linear problems.
 
 ::: lineax.QR
-    selection:
+    options:
         members:
-            false
+            - __init__
 
 ---
 
 ::: lineax.SVD
-    selection:
-        members:
-            - __init__
-
-!!! info
-
-    In addition to these, `lineax.Diagonal(well_posed=False)` and [`lineax.NormalCG`][] (below) also support ill-posed problems.
-
-## Structure-exploiting solvers
-
-These require special structure in the operator. (And will throw an error if passed an operator without that structure.) In return, they are able to solve the linear problem much more efficiently.
-
-::: lineax.Cholesky
-    selection:
-        members:
-            false
-
----
-
-::: lineax.Diagonal
-    selection:
+    options:
         members:
             - __init__
 
 ---
 
-::: lineax.Triangular
-    selection:
+::: lineax.Normal
+    options:
         members:
-            false
+            - __init__
 
 ---
 
-::: lineax.Tridiagonal
-    selection:
+::: lineax.LSMR
+    options:
         members:
-            false
+            - __init__
 
-!!! info
 
-    In addition to these, [`lineax.CG`][] also requires special structure (positive or negative definiteness).
+#### Diagonal
+
+In addition to these, [`lineax.Diagonal`][] with `well_posed=False` (below) also supports ill-posed problems.
 
 ## Iterative solvers
 
@@ -89,27 +70,58 @@ These solvers use only matrix-vector products, and do not require instantiating 
     Note that [`lineax.BiCGStab`][] and [`lineax.GMRES`][] may fail to converge on some (typically non-sparse) problems.
 
 ::: lineax.CG
-    selection:
-        members:
-            - __init__
-
----
-
-::: lineax.NormalCG
-    selection:
+    options:
         members:
             - __init__
 
 ---
 
 ::: lineax.BiCGStab
-    selection:
+    options:
         members:
             - __init__
 
 ---
 
 ::: lineax.GMRES
-    selection:
+    options:
         members:
             - __init__
+
+#### LSMR
+
+In addition to these, [`lineax.LSMR`][] (above) is also an iterative method.
+
+## Structure-exploiting solvers
+
+These require special structure in the operator. (And will throw an error if passed an operator without that structure.) In return, they are able to solve the linear problem much more efficiently.
+
+::: lineax.Cholesky
+    options:
+        members:
+            - __init__
+
+---
+
+::: lineax.Diagonal
+    options:
+        members:
+            - __init__
+
+---
+
+::: lineax.Triangular
+    options:
+        members:
+            - __init__
+
+---
+
+::: lineax.Tridiagonal
+    options:
+        members:
+            - __init__
+
+#### CG
+
+In addition to these, [`lineax.CG`][] also requires special structure (positive or negative definiteness).

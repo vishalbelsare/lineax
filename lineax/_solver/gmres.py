@@ -14,8 +14,7 @@
 
 import functools as ft
 from collections.abc import Callable
-from typing import Any, cast, Optional
-from typing_extensions import TypeAlias
+from typing import Any, cast, TypeAlias
 
 import equinox.internal as eqxi
 import jax
@@ -25,12 +24,9 @@ import jax.tree_util as jtu
 from equinox.internal import ω
 from jaxtyping import Array, ArrayLike, Bool, Float, Inexact, PyTree
 
+from .._misc import structure_equal
 from .._norm import max_norm, two_norm
-from .._operator import (
-    AbstractLinearOperator,
-    conj,
-    MatrixLinearOperator,
-)
+from .._operator import AbstractLinearOperator, conj, linearise, MatrixLinearOperator
 from .._solution import RESULTS
 from .._solve import AbstractLinearSolver, linear_solve
 from .misc import preconditioner_and_y0
@@ -40,7 +36,7 @@ from .qr import QR
 _GMRESState: TypeAlias = AbstractLinearOperator
 
 
-class GMRES(AbstractLinearSolver[_GMRESState], strict=True):
+class GMRES(AbstractLinearSolver[_GMRESState]):
     """GMRES solver for linear systems.
 
     The operator should be square.
@@ -50,9 +46,11 @@ class GMRES(AbstractLinearSolver[_GMRESState], strict=True):
     This supports the following `options` (as passed to
     `lx.linear_solve(..., options=...)`).
 
-    - `preconditioner`: A positive definite [`lineax.AbstractLinearOperator`][]
+    - `preconditioner`: A [`lineax.AbstractLinearOperator`][]
         to be used as preconditioner. Defaults to
-        [`lineax.IdentityLinearOperator`][].
+        [`lineax.IdentityLinearOperator`][]. This method uses left preconditioning,
+        so it is the preconditioned residual that is minimized, though the actual
+        termination criteria uses the un-preconditioned residual.
     - `y0`: The initial estimate of the solution to the linear system. Defaults to all
         zeros.
     """
@@ -60,7 +58,7 @@ class GMRES(AbstractLinearSolver[_GMRESState], strict=True):
     rtol: float
     atol: float
     norm: Callable = max_norm
-    max_steps: Optional[int] = None
+    max_steps: int | None = None
     restart: int = 20
     stagnation_iters: int = 20
 
@@ -78,12 +76,13 @@ class GMRES(AbstractLinearSolver[_GMRESState], strict=True):
                 )
 
     def init(self, operator: AbstractLinearOperator, options: dict[str, Any]):
-        if operator.in_structure() != operator.out_structure():
+        del options
+        if not structure_equal(operator.in_structure(), operator.out_structure()):
             raise ValueError(
                 "`GMRES(..., normal=False)` may only be used for linear solves with "
                 "square matrices."
             )
-        return operator
+        return linearise(operator)
 
     #
     # This differs from `jax.scipy.sparse.linalg.gmres` in a few ways:
@@ -217,14 +216,15 @@ class GMRES(AbstractLinearSolver[_GMRESState], strict=True):
 
         if self.max_steps is None:
             result = RESULTS.where(
-                (num_steps == max_steps), RESULTS.singular, RESULTS.successful
+                num_steps == max_steps, RESULTS.singular, RESULTS.successful
+            )
+        elif has_scale:
+            result = RESULTS.where(
+                num_steps == max_steps, RESULTS.max_steps_reached, RESULTS.successful
             )
         else:
-            result = RESULTS.where(
-                (num_steps == self.max_steps),
-                RESULTS.max_steps_reached,
-                RESULTS.successful,
-            )
+            result = RESULTS.successful
+
         result = RESULTS.where(
             stagnation_counter >= self.stagnation_iters, RESULTS.stagnation, result
         )
@@ -294,7 +294,7 @@ class GMRES(AbstractLinearSolver[_GMRESState], strict=True):
             )
             beta_vec = jnp.concatenate(
                 (
-                    r_norm[None].astype(coeff_mat),
+                    r_norm[None].astype(jnp.result_type(coeff_mat)),
                     jnp.zeros_like(coeff_mat, shape=(restart,)),
                 )
             )
@@ -373,7 +373,7 @@ class GMRES(AbstractLinearSolver[_GMRESState], strict=True):
             basis_step_normalised,
             basis,
         )
-        proj_new = proj.at[step + 1].set(step_norm_new.astype(proj))
+        proj_new = proj.at[step + 1].set(step_norm_new.astype(jnp.result_type(proj)))
         #
         # NOTE: two somewhat complicated things are going on here:
         #
@@ -399,36 +399,35 @@ class GMRES(AbstractLinearSolver[_GMRESState], strict=True):
         return basis_new, coeff_mat_new, breakdown
 
     def _normalise(
-        self, x: PyTree[Array], eps: Optional[Float[ArrayLike, ""]]
+        self, x: PyTree[Array], eps: Float[ArrayLike, ""] | None
     ) -> tuple[PyTree[Array], Inexact[Array, ""], Bool[ArrayLike, ""]]:
         norm = two_norm(x)
         if eps is None:
             eps = jnp.finfo(norm.dtype).eps
         else:
             eps = jnp.astype(eps, norm.dtype)
-        breakdown = norm < eps
+        breakdown = norm < eps  # pyright: ignore
         safe_norm = jnp.where(breakdown, jnp.inf, norm)
         with jax.numpy_dtype_promotion("standard"):
             x_normalised = (x**ω / safe_norm).ω
         return x_normalised, norm, breakdown
 
     def transpose(self, state: _GMRESState, options: dict[str, Any]):
-        del options
-        operator = state
         transpose_options = {}
+        if "preconditioner" in options:
+            transpose_options["preconditioner"] = options["preconditioner"].transpose()
+        operator = state
         return operator.transpose(), transpose_options
 
     def conj(self, state: _GMRESState, options: dict[str, Any]):
-        del options
-        operator = state
         conj_options = {}
+        if "preconditioner" in options:
+            conj_options["preconditioner"] = conj(options["preconditioner"])
+        operator = state
         return conj(operator), conj_options
 
-    def allow_dependent_columns(self, operator):
-        return False
-
-    def allow_dependent_rows(self, operator):
-        return False
+    def assume_full_rank(self):
+        return True
 
 
 GMRES.__init__.__doc__ = r"""**Arguments:**
